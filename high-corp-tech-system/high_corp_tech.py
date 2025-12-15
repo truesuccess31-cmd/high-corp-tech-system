@@ -13,8 +13,7 @@ for package in required_packages:
         else:
             __import__(package)
     except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
+      subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 # Now import everything
 import streamlit as st
 import pandas as pd
@@ -849,3 +848,4 @@ if st.session_state.clocked_in:
     # Auto-refresh every 60 seconds when clocked in
     time.sleep(60)
     st.rerun()
+
