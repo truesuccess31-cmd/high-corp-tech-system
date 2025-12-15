@@ -1,13 +1,28 @@
+import sys
+import subprocess
+
+# Try to import additional packages, install if missing
+required_packages = ['openpyxl', 'pytz', 'Pillow', 'sqlite3']
+
+for package in required_packages:
+    try:
+        if package == 'Pillow':
+            from PIL import Image
+        elif package == 'sqlite3':
+            import sqlite3
+        else:
+            __import__(package)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Now import everything
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
-import numpy as np
-import sqlite3
-import hashlib
-import json
-import time
-from PIL import Image
+import openpyxl
 import pytz
+from PIL import Image
+import sqlite3
+# ... rest of your imports
 
 # ========== DATABASE SETUP ==========
 def init_database():
@@ -830,3 +845,4 @@ if st.session_state.clocked_in:
     # Auto-refresh every 60 seconds when clocked in
     time.sleep(60)
     st.rerun()
+
