@@ -22,7 +22,11 @@ import openpyxl
 import pytz
 from PIL import Image
 import sqlite3
-# ... rest of your imports
+import hashlib
+import json
+import time
+from datetime import datetime, timedelta
+import numpy as np
 
 # ========== DATABASE SETUP ==========
 def init_database():
@@ -845,4 +849,3 @@ if st.session_state.clocked_in:
     # Auto-refresh every 60 seconds when clocked in
     time.sleep(60)
     st.rerun()
-
