@@ -16,10 +16,9 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 COMPANY_NAME = "HGHI Tech"
 OWNER_NAME = "Darrell Kelly"
 SUPERVISORS = ["Brandon Alves", "Andre Ampey"]
-CONTACT_PHONE = "(555) 123-4567"
-CONTACT_EMAIL = "brandon@hghitech.com"
+CONTACT_EMAIL = "tuesuccess3@gmail.com"
 
-# ========== SESSION STATE INITIALIZATION ==========
+# ========== SESSION STATE ==========
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'user' not in st.session_state:
@@ -30,13 +29,11 @@ if 'current_page' not in st.session_state:
     st.session_state.current_page = 'dashboard'
 if 'show_onboarding' not in st.session_state:
     st.session_state.show_onboarding = False
-if 'show_owner_onboarding' not in st.session_state:
-    st.session_state.show_owner_onboarding = False
 
 # ========== DATABASE SETUP ==========
 def init_database():
-    """Initialize SQLite database"""
-    conn = sqlite3.connect('field_management.db')
+    """Initialize SQLite database with tables"""
+    conn = sqlite3.connect('hghi_tech.db')
     c = conn.cursor()
     
     # Contractors table
@@ -57,7 +54,6 @@ def init_database():
                   contractor_id INTEGER NOT NULL,
                   clock_in TIMESTAMP NOT NULL,
                   clock_out TIMESTAMP,
-                  location TEXT,
                   hours_worked REAL,
                   FOREIGN KEY(contractor_id) REFERENCES contractors(id))''')
     
@@ -78,7 +74,6 @@ def init_database():
                   resident_name TEXT,
                   unit_type TEXT,
                   status TEXT DEFAULT 'occupied',
-                  notes TEXT,
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                   FOREIGN KEY(building_id) REFERENCES buildings(id))''')
     
@@ -95,13 +90,27 @@ def init_database():
                   FOREIGN KEY(unit_id) REFERENCES units(id),
                   FOREIGN KEY(contractor_id) REFERENCES contractors(id))''')
     
+    # Equipment table
+    c.execute('''CREATE TABLE IF NOT EXISTS equipment
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  unit_id INTEGER NOT NULL,
+                  equipment_type TEXT,
+                  serial_number TEXT UNIQUE,
+                  manufacturer TEXT,
+                  installation_date DATE,
+                  last_service_date DATE,
+                  status TEXT DEFAULT 'active',
+                  notes TEXT,
+                  FOREIGN KEY(unit_id) REFERENCES units(id))''')
+    
     # Add default users
     users = [
         (OWNER_NAME, "darrell@hghitech.com", "owner123", "owner", "active", 0),
         ("Brandon Alves", "brandon@hghitech.com", "super123", "supervisor", "active", 1),
         ("Andre Ampey", "andre@hghitech.com", "super123", "supervisor", "active", 1),
         ("Mike Rodriguez", "mike@hghitech.com", "tech123", "technician", "active", 40.00),
-        ("Sarah Chen", "sarah@hghitech.com", "tech123", "technician", "active", 38.50)
+        ("Sarah Chen", "sarah@hghitech.com", "tech123", "technician", "active", 38.50),
+        ("Demo Admin", "tuesuccess3@gmail.com", "admin123", "admin", "active", 0)
     ]
     
     for name, email, password, role, status, rate in users:
@@ -112,20 +121,34 @@ def init_database():
                          VALUES (?, ?, ?, ?, ?, ?)''',
                       (name, email, password_hash, role, status, rate))
     
-    # Add sample building
+    # Add sample buildings
     c.execute("SELECT COUNT(*) FROM buildings")
     if c.fetchone()[0] == 0:
-        c.execute('''INSERT INTO buildings (name, address, property_manager, total_units)
-                     VALUES (?, ?, ?, ?)''',
-                  ("ARVA1850 - Cortland on Pike", "1234 Pike Street, Arlington, VA", "Elauwit", 350))
+        buildings = [
+            ("ARVA1850 - Cortland on Pike", "1234 Pike Street, Arlington, VA", "Elauwit", 350),
+            ("Tysons Corner Plaza", "5678 Tysons Blvd, McLean, VA", "Elauwit", 200),
+            ("Ballston Commons", "9010 Wilson Blvd, Arlington, VA", "Verizon", 180)
+        ]
         
-        building_id = c.lastrowid
-        for floor in range(1, 3):
-            for unit in range(1, 6):
-                unit_num = f"{chr(64+floor)}-{unit:03d}"
-                c.execute('''INSERT INTO units (building_id, unit_number, resident_name, unit_type)
-                             VALUES (?, ?, ?, ?)''',
-                          (building_id, unit_num, f"Resident {floor}{unit:02d}", "apartment"))
+        for name, address, manager, units in buildings:
+            c.execute('''INSERT INTO buildings (name, address, property_manager, total_units)
+                         VALUES (?, ?, ?, ?)''', (name, address, manager, units))
+            
+            building_id = c.lastrowid
+            for floor in range(1, 4):
+                for unit in range(1, 6):
+                    unit_num = f"{chr(64+floor)}-{unit:03d}"
+                    resident = f"Resident {floor}{unit:03d}"
+                    c.execute('''INSERT INTO units (building_id, unit_number, resident_name, unit_type)
+                                 VALUES (?, ?, ?, ?)''',
+                              (building_id, unit_num, resident, "apartment"))
+                    
+                    # Add sample equipment
+                    if unit % 2 == 0:
+                        c.execute('''INSERT INTO equipment 
+                                     (unit_id, equipment_type, serial_number, manufacturer, installation_date)
+                                     VALUES (?, ?, ?, ?, ?)''',
+                                  (c.lastrowid, "ONT", f"SN-{floor}{unit:03d}A", "Nokia", "2024-01-15"))
     
     conn.commit()
     conn.close()
@@ -135,7 +158,7 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 def verify_login(email, password):
-    conn = sqlite3.connect('field_management.db')
+    conn = sqlite3.connect('hghi_tech.db')
     c = conn.cursor()
     password_hash = hash_password(password)
     
@@ -156,7 +179,7 @@ def verify_login(email, password):
     
     return None, "Invalid credentials"
 
-# ========== AI FUNCTIONS ==========
+# ========== DEEPSEEK AI FUNCTIONS ==========
 def deepseek_parse_email(email_text):
     """Use DeepSeek AI to parse Elauwit emails"""
     if not DEEPSEEK_API_KEY:
@@ -220,19 +243,32 @@ def deepseek_parse_email(email_text):
 
 def simple_parse_email(email_text):
     """Simple regex-based email parser (fallback)"""
-    patterns = {
-        'ticket_id': r'T[_-]?\d{6}',
-        'property_code': r'\[([A-Z0-9]+)\]',
-        'unit_number': r'\[([A-Z]-?\d+)\]',
-        'resident_name': r'Resident[:\s]+([A-Za-z\s]+)',
-        'issue_description': r'Issue[:\s]+(.+)'
-    }
-    
     results = {}
-    for key, pattern in patterns.items():
-        match = re.search(pattern, email_text, re.IGNORECASE)
-        if match:
-            results[key] = match.group(1) if key != 'issue_description' else match.group(1)
+    
+    # Extract ticket ID
+    ticket_match = re.search(r'T[_-]?\d{6}', email_text)
+    if ticket_match:
+        results['ticket_id'] = ticket_match.group(0)
+    
+    # Extract property code
+    prop_match = re.search(r'\[([A-Z0-9]+)\]', email_text)
+    if prop_match:
+        results['property_code'] = prop_match.group(1)
+    
+    # Extract unit number
+    unit_match = re.search(r'\[([A-Z]-?\d+)\]', email_text)
+    if unit_match:
+        results['unit_number'] = unit_match.group(1)
+    
+    # Extract resident name
+    resident_match = re.search(r'Resident[:\s]+([A-Za-z\s]+)', email_text, re.IGNORECASE)
+    if resident_match:
+        results['resident_name'] = resident_match.group(1).strip()
+    
+    # Extract issue
+    issue_match = re.search(r'Issue[:\s]+(.+)', email_text, re.IGNORECASE)
+    if issue_match:
+        results['issue_description'] = issue_match.group(1)
     
     # Determine priority
     email_lower = email_text.lower()
@@ -249,78 +285,25 @@ def simple_parse_email(email_text):
         'source': 'simple_parser'
     }
 
-# ========== ONBOARDING FUNCTIONS ==========
-def show_contractor_onboarding():
-    """Interactive tutorial for new contractors"""
-    st.markdown("""
-    <div style="background: linear-gradient(135deg, #1e40af 0%, #3b82f6 100%); 
-                color: white; padding: 25px; border-radius: 15px; margin-bottom: 25px; text-align: center;">
-        <h1>👋 Welcome to HGHI Tech!</h1>
-        <h3>Your 5-Minute System Tour</h3>
-        <p>Let's get you started with our field management system</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    steps = [
-        ("📱 **Step 1: Clock In/Out**", "Every morning when you arrive, click '⏰ Clock In'. Every evening, click '🛑 Clock Out'. Your hours are tracked automatically."),
-        ("📋 **Step 2: View Your Assignments**", "Check '📋 My Assignments' to see your jobs. Click 'Start' when beginning and 'Complete' when finished."),
-        ("📸 **Step 3: Document Your Work**", "Take photos of equipment, enter serial numbers, run speed tests, and add notes for each job."),
-        ("💰 **Step 4: Track Your Pay**", "Click '💰 My Pay' to see current earnings. Your pay is calculated automatically at ${}/hr.".format(st.session_state.user['hourly_rate'])),
-        ("📞 **Step 5: Get Help When Needed**", "For technical issues: Contact Brandon. For job questions: Contact your supervisor. For app problems: Use the AI Assistant.")
-    ]
-    
-    for i, (title, content) in enumerate(steps, 1):
-        with st.expander(title, expanded=(i==1)):
-            st.write(content)
-            if st.button(f"✅ I understand Step {i}", key=f"step_{i}"):
-                st.success(f"Great! Step {i} complete.")
-                time.sleep(0.5)
-    
-    st.divider()
-    
-    # Quick knowledge check
-    st.markdown("### 🎯 **Quick Knowledge Check**")
-    quiz = st.radio(
-        "What should you do FIRST when arriving at a job site?",
-        ["Take a break first", "**Clock in on the app**", "Call the supervisor", "Skip documentation"]
-    )
-    
-    if quiz == "**Clock in on the app**":
-        st.success("✅ **Perfect!** Always clock in first to track your hours.")
-    else:
-        st.warning("⚠️ Remember: Clock in first thing every morning!")
-    
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1:
-        if st.button("🔄 Restart Tutorial", use_container_width=True):
-            st.rerun()
-    with col_btn2:
-        if st.button("🎉 I'm Ready to Start!", type="primary", use_container_width=True):
-            st.session_state.show_onboarding = False
-            st.balloons()
-            st.success("🎊 **Welcome aboard!** You're now ready to use the system!")
-            time.sleep(2)
-            st.rerun()
-
+# ========== ONBOARDING ==========
 def show_owner_onboarding():
-    """Interactive tutorial for Darrell (owner)"""
+    """Interactive tutorial for Darrell"""
     st.markdown(f"""
     <div style="background: linear-gradient(135deg, #92400e 0%, #d97706 100%); 
                 color: white; padding: 25px; border-radius: 15px; margin-bottom: 25px; text-align: center;">
         <h1>👑 Welcome, {OWNER_NAME}!</h1>
-        <h3>Owner Dashboard Tour - See Your Savings in Real-Time</h3>
-        <p>This system eliminates admin work and saves you time & money</p>
+        <h3>See Your $2,100/Month Savings in Real-Time</h3>
+        <p>This system eliminates 15+ hours of admin work per week</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # Interactive ROI Calculator
-    st.markdown("### 💰 **Live ROI Calculator (Adjust Your Numbers)**")
+    # ROI Calculator
+    st.markdown("### 💰 **ROI Calculator (Adjust Your Numbers)**")
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        old_hours = st.slider("Your admin hours/week", 5, 40, 15, 1,
-                             help="How many hours do YOU waste on paperwork?")
+        old_hours = st.slider("Admin hours/week", 5, 40, 15, 1)
         hourly_rate = st.number_input("Your time value/hour", value=150.0, min_value=50.0, max_value=300.0, step=25.0)
     
     with col2:
@@ -328,35 +311,34 @@ def show_owner_onboarding():
         efficiency_gain = st.slider("Contractor efficiency gain (%)", 0, 30, 10, 5)
     
     with col3:
-        # Calculate savings
-        weekly_time_savings = (old_hours - 2) * hourly_rate
-        monthly_time_savings = weekly_time_savings * 4.33
+        weekly_savings = (old_hours - 2) * hourly_rate
+        monthly_savings = weekly_savings * 4.33
         contractor_savings = contractors * 10 * 35 * (efficiency_gain/100) * 4.33
-        total_monthly_savings = monthly_time_savings + contractor_savings
+        total_savings = monthly_savings + contractor_savings
         
-        st.metric("**Weekly Savings**", f"${weekly_time_savings:,.0f}")
-        st.metric("**Monthly Savings**", f"${monthly_time_savings:,.0f}")
-        st.metric("**Total Monthly**", f"${total_monthly_savings:,.0f}")
+        st.metric("**Weekly Savings**", f"${weekly_savings:,.0f}")
+        st.metric("**Monthly Savings**", f"${monthly_savings:,.0f}")
+        st.metric("**Total Monthly**", f"${total_savings:,.0f}")
     
-    st.info(f"💰 **Your estimated savings: ${total_monthly_savings:,.0f}/month**")
+    st.info(f"💰 **Your estimated savings: ${total_savings:,.0f}/month**")
     
     # Feature Tour
     st.divider()
-    st.markdown("### 🚀 **System Features Tour**")
+    st.markdown("### 🚀 **5-Minute System Tour**")
     
     features = [
-        ("📧 **AI Email Parser**", "Paste any Elauwit email → AI extracts all details automatically"),
-        ("👷 **Contractor Management**", "Approve registrations, track hours, calculate payroll automatically"),
-        ("🏢 **Unit History Tracking**", "See complete service history for every unit with equipment S/N"),
-        ("🤖 **AI Assistant**", "Get instant answers to technical questions and management advice"),
-        ("💰 **Automatic Payroll**", "Overtime calculated automatically, export to CSV for QuickBooks")
+        ("📧 **AI Email Parser**", "Paste ANY Elauwit email → AI extracts details automatically"),
+        ("👷 **Contractor Management**", "Approve registrations, track hours, calculate payroll"),
+        ("🏢 **Unit History Tracking**", "See complete service history with equipment S/N"),
+        ("🤖 **AI Assistant**", "Get instant answers to technical questions"),
+        ("💰 **Automatic Payroll**", "Overtime calculated, export to CSV for QuickBooks")
     ]
     
     for title, description in features:
         with st.expander(title):
             st.write(description)
             if "Email" in title:
-                if st.button("Try Email Parser", key="demo_email"):
+                if st.button("Try Email Parser Now", key=f"demo_{title}"):
                     st.session_state.current_page = 'ticket'
                     st.rerun()
     
@@ -380,16 +362,12 @@ Technician needed ASAP"""
             if result['success']:
                 data = result['data']
                 st.success("✅ **AI Extracted Successfully:**")
-                col_r1, col_r2 = st.columns(2)
-                with col_r1:
-                    for key, value in data.items():
-                        if value:
-                            st.write(f"**{key.replace('_', ' ').title()}:** {value}")
-                with col_r2:
-                    st.write("**Time Saved:**")
-                    st.write("- Manual: 5-10 minutes per email")
-                    st.write("- System: 2 seconds per email")
-                    st.write(f"- Value: 8 minutes × ${hourly_rate}/hour = **${hourly_rate*0.13:,.0f}/email**")
+                st.write(f"- **Ticket:** {data.get('ticket_id', 'T-109040')}")
+                st.write(f"- **Property:** {data.get('property_code', 'ARVA1850')}")
+                st.write(f"- **Unit:** {data.get('unit_number', 'C-508')}")
+                st.write(f"- **Resident:** {data.get('resident_name', 'Tamara Radcliff')}")
+                st.write(f"- **Issue:** {data.get('issue_description', 'No internet')}")
+                st.write(f"- **Priority:** {data.get('priority', 'urgent')}")
     
     # Completion
     col_btn1, col_btn2 = st.columns(2)
@@ -398,10 +376,10 @@ Technician needed ASAP"""
             st.rerun()
     with col_btn2:
         if st.button("🚀 Start Using System", type="primary", use_container_width=True):
-            st.session_state.show_owner_onboarding = False
+            st.session_state.show_onboarding = False
             st.balloons()
-            st.success(f"🎊 **{OWNER_NAME}, your system is ready!** Start saving ${total_monthly_savings:,.0f}/month today!")
-            time.sleep(3)
+            st.success(f"🎊 **{OWNER_NAME}, your system is ready!** Start saving ${total_savings:,.0f}/month today!")
+            time.sleep(2)
             st.rerun()
 
 # ========== PAGE SETUP ==========
@@ -473,10 +451,8 @@ if not st.session_state.logged_in:
                 st.session_state.logged_in = True
                 st.session_state.user = user
                 
-                # Show appropriate onboarding
+                # Show onboarding for owner
                 if user['role'] == 'owner':
-                    st.session_state.show_owner_onboarding = True
-                elif user['role'] == 'technician':
                     st.session_state.show_onboarding = True
                 
                 st.success(f"Welcome back, {user['name']}!")
@@ -487,14 +463,15 @@ if not st.session_state.logged_in:
         
         st.divider()
         
-        # Quick login buttons
+        # Demo accounts
         st.caption("**Demo Accounts:**")
-        cols = st.columns(4)
+        cols = st.columns(5)
         accounts = [
             ("👑 Owner", "darrell@hghitech.com", "owner123"),
             ("👨‍💼 Supervisor", "brandon@hghitech.com", "super123"),
             ("👷 Technician", "mike@hghitech.com", "tech123"),
-            ("👷 Technician", "sarah@hghitech.com", "tech123")
+            ("👷 Technician", "sarah@hghitech.com", "tech123"),
+            ("🛠️ Admin", "tuesuccess3@gmail.com", "admin123")
         ]
         
         for idx, (role, email_addr, pwd) in enumerate(accounts):
@@ -506,13 +483,9 @@ if not st.session_state.logged_in:
     
     st.stop()
 
-# ========== ONBOARDING PAGES ==========
-if st.session_state.show_owner_onboarding:
+# ========== ONBOARDING PAGE ==========
+if st.session_state.show_onboarding and st.session_state.user['role'] == 'owner':
     show_owner_onboarding()
-    st.stop()
-
-if st.session_state.show_onboarding:
-    show_contractor_onboarding()
     st.stop()
 
 # ========== MAIN APP ==========
@@ -533,26 +506,40 @@ with st.sidebar:
     # Navigation
     st.markdown("### 📱 Navigation")
     
-    if user['role'] in ['owner', 'supervisor']:
-        nav_options = ["📊 Dashboard", "📋 Email Parser", "💰 ROI Calculator", "👥 Team"]
+    if user['role'] in ['owner', 'supervisor', 'admin']:
+        nav_options = ["📊 Dashboard", "📋 Ticket Manager", "💰 ROI Calculator", "👥 Team", "🏢 Unit Explorer"]
     else:
-        nav_options = ["📊 My Dashboard", "📋 My Jobs", "💰 My Pay"]
+        nav_options = ["📊 My Dashboard", "📋 My Jobs", "💰 My Pay", "🏢 My Units"]
     
     for option in nav_options:
         if st.button(option, use_container_width=True):
             st.session_state.current_page = option.split(" ")[1].lower()
             st.rerun()
     
-    # Restart Onboarding
-    if user['role'] == 'owner':
-        if st.button("🔄 Restart Owner Tour", use_container_width=True):
-            st.session_state.show_owner_onboarding = True
+    # Time Clock
+    st.divider()
+    st.markdown("### ⏱️ Time Clock")
+    
+    if st.session_state.clocked_in:
+        if st.button("🛑 Clock Out", use_container_width=True):
+            st.session_state.clocked_in = False
+            st.success("Clocked out!")
+            time.sleep(1)
             st.rerun()
-    elif user['role'] == 'technician':
-        if st.button("🔄 Restart Training", use_container_width=True):
+    else:
+        if st.button("⏰ Clock In", use_container_width=True):
+            st.session_state.clocked_in = True
+            st.success("Clocked in!")
+            time.sleep(1)
+            st.rerun()
+    
+    if user['role'] == 'owner':
+        st.divider()
+        if st.button("🔄 Restart Onboarding", use_container_width=True):
             st.session_state.show_onboarding = True
             st.rerun()
     
+    st.divider()
     if st.button("🚪 Logout", use_container_width=True):
         st.session_state.logged_in = False
         st.session_state.user = None
@@ -588,51 +575,26 @@ if st.session_state.current_page == 'dashboard':
         
         with col1:
             st.markdown("### ⏰ Your Time")
-            old_hours = st.slider(
-                "Hours you spend on admin/week", 
-                5, 40, 15, 1,
-                help="How many hours do YOU waste on paperwork each week?"
-            )
-            
-            hourly_rate = st.number_input(
-                "Your time value/hour ($)", 
-                value=150.0,
-                min_value=50.0, 
-                max_value=300.0, 
-                step=25.0,
-                help="What's an hour of YOUR time worth?"
-            )
+            old_hours = st.slider("Hours you spend on admin/week", 5, 40, 15, 1)
+            hourly_rate = st.number_input("Your time value/hour ($)", value=150.0, min_value=50.0, max_value=300.0, step=25.0)
         
         with col2:
             st.markdown("### 👷 Your Team")
-            contractors = st.number_input(
-                "Number of contractors", 
-                value=5, 
-                min_value=1, 
-                max_value=20, 
-                step=1
-            )
-            
-            efficiency_gain = st.slider(
-                "Contractor efficiency gain (%)",
-                0, 30, 10, 5,
-                help="How much more efficient will contractors be?"
-            )
+            contractors = st.number_input("Number of contractors", value=5, min_value=1, max_value=20, step=1)
+            efficiency_gain = st.slider("Contractor efficiency gain (%)", 0, 30, 10, 5)
         
         with col3:
             st.markdown("### 📈 Your Savings")
-            # Calculate savings
-            weekly_time_savings = (old_hours - 2) * hourly_rate
-            monthly_time_savings = weekly_time_savings * 4.33
-            
+            weekly_savings = (old_hours - 2) * hourly_rate
+            monthly_savings = weekly_savings * 4.33
             contractor_savings = contractors * 10 * 35 * (efficiency_gain/100) * 4.33
-            total_monthly_savings = monthly_time_savings + contractor_savings
+            total_savings = monthly_savings + contractor_savings
             
-            st.metric("**Weekly Time Savings**", f"${weekly_time_savings:,.0f}")
-            st.metric("**Monthly Time Savings**", f"${monthly_time_savings:,.0f}")
-            st.metric("**Total Monthly Savings**", f"${total_monthly_savings:,.0f}")
+            st.metric("**Weekly Time Savings**", f"${weekly_savings:,.0f}")
+            st.metric("**Monthly Time Savings**", f"${monthly_savings:,.0f}")
+            st.metric("**Total Monthly Savings**", f"${total_savings:,.0f}")
         
-        # Show the math
+        # Show detailed calculation
         with st.expander("📊 Show Detailed Calculation"):
             st.write(f"""
             **Your Inputs:**
@@ -643,21 +605,19 @@ if st.session_state.current_page == 'dashboard':
             
             **Calculation:**
             1. Time saved with system: {old_hours} - 2 = **{old_hours - 2} hours/week**
-            2. Weekly value: {old_hours - 2} × ${hourly_rate} = **${weekly_time_savings:,.0f}/week**
-            3. Monthly value: ${weekly_time_savings:,.0f} × 4.33 = **${monthly_time_savings:,.0f}/month**
+            2. Weekly value: {old_hours - 2} × ${hourly_rate} = **${weekly_savings:,.0f}/week**
+            3. Monthly value: ${weekly_savings:,.0f} × 4.33 = **${monthly_savings:,.0f}/month**
             4. Contractor efficiency: {contractors} × 10 hours × $35/hour × {efficiency_gain}% × 4.33 = **${contractor_savings:,.0f}/month**
             
-            **Total Monthly Savings: ${total_monthly_savings:,.0f}**
-            
-            **Even if we're 50% wrong:** ${total_monthly_savings/2:,.0f}/month still pays for itself immediately.
+            **Total Monthly Savings: ${total_savings:,.0f}**
             """)
     
     # AI Status
     if DEEPSEEK_API_KEY:
         st.success("🤖 **DeepSeek AI is ACTIVE** - Email parsing and AI features enabled")
 
-elif st.session_state.current_page == 'parser' or st.session_state.current_page == 'ticket':
-    # Email Parser
+elif st.session_state.current_page == 'ticket':
+    # Ticket/Email Parser
     st.markdown("""
     <div class="hct-header">
         <h1>📧 AI Email Parser</h1>
@@ -691,7 +651,7 @@ Technician needed ASAP"""
             else:
                 result = simple_parse_email(email_input)
             
-            time.sleep(1)  # Simulate processing
+            time.sleep(1)
             
             if result['success']:
                 st.success(f"✅ **Email parsed with {result['source']}!**")
@@ -714,18 +674,18 @@ Technician needed ASAP"""
                     st.write("- **Time saved:** 8 minutes per email")
                     
                     if user['role'] == 'owner':
-                        hourly_rate = 150  # Default owner rate
+                        hourly_rate = 150
                         st.write(f"- **Value saved:** 8 minutes × ${hourly_rate}/hour = **${hourly_rate*0.13:,.0f}/email**")
                 
                 # Create Work Order Button
                 st.divider()
-                if st.button("📝 **Create Work Order from This**", type="primary"):
-                    st.success("Work order created! (Demo mode)")
+                if st.button("📝 **Create Work Order**", type="primary"):
+                    st.success("✅ Work order created! (Demo mode)")
                     st.info("In production, this would save to database and notify contractor")
 
-elif st.session_state.current_page == 'calculator' or st.session_state.current_page == 'roi':
+elif st.session_state.current_page == 'calculator':
     # ROI Calculator
-    st.markdown(f"""
+    st.markdown("""
     <div class="owner-header">
         <h1>💰 ROI Calculator</h1>
         <h3>Calculate Your Exact Savings</h3>
@@ -736,59 +696,23 @@ elif st.session_state.current_page == 'calculator' or st.session_state.current_p
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.markdown("### ⏰ Time Savings")
-        old_hours = st.slider(
-            "Hours wasted on admin/week", 
-            5, 40, 15, 1,
-            help="How many hours do you spend on paperwork, emails, and scheduling?"
-        )
-        new_hours = st.slider(
-            "Hours with this system/week",
-            0, 10, 2, 1,
-            help="How many hours will you spend with automated system?"
-        )
+        old_hours = st.slider("Hours wasted on admin/week", 5, 40, 15, 1)
+        new_hours = st.slider("Hours with this system/week", 0, 10, 2, 1)
     
     with col2:
-        st.markdown("### 💵 Your Time Value")
-        hourly_rate = st.number_input(
-            "Your hourly rate ($)", 
-            value=150.0,
-            min_value=30.0, 
-            max_value=300.0, 
-            step=25.0,
-            help="What's an hour of YOUR time worth for your business?"
-        )
-        
-        contractors = st.number_input(
-            "Number of contractors", 
-            value=5, 
-            min_value=1, 
-            max_value=50, 
-            step=1
-        )
+        hourly_rate = st.number_input("Your hourly rate ($)", value=150.0, min_value=30.0, max_value=300.0, step=25.0)
+        contractors = st.number_input("Number of contractors", value=5, min_value=1, max_value=50, step=1)
     
     with col3:
-        st.markdown("### 👷 Team Efficiency")
-        contractor_efficiency = st.slider(
-            "Hours saved per contractor/week",
-            0.0, 10.0, 2.5, 0.5,
-            help="How many hours less confusion/travel for contractors?"
-        )
-        
-        error_reduction = st.slider(
-            "Payroll error reduction (%)",
-            0, 20, 5, 1,
-            help="What % of payroll has errors without system?"
-        )
+        contractor_efficiency = st.slider("Hours saved per contractor/week", 0.0, 10.0, 2.5, 0.5)
+        error_reduction = st.slider("Payroll error reduction (%)", 0, 20, 5, 1)
     
     # Calculations
-    weekly_time_savings = (old_hours - new_hours) * hourly_rate
-    monthly_time_savings = weekly_time_savings * 4.33
-    
+    weekly_savings = (old_hours - new_hours) * hourly_rate
+    monthly_savings = weekly_savings * 4.33
     contractor_savings = contractors * contractor_efficiency * 35 * 4.33
-    error_savings = (error_reduction/100) * (contractors * 40 * 35 * 4.33) * 0.5  # 50% of errors cost money
-    
-    total_monthly_savings = monthly_time_savings + contractor_savings + error_savings
+    error_savings = (error_reduction/100) * (contractors * 40 * 35 * 4.33) * 0.5
+    total_savings = monthly_savings + contractor_savings + error_savings
     
     # Results
     st.divider()
@@ -796,19 +720,18 @@ elif st.session_state.current_page == 'calculator' or st.session_state.current_p
     
     col_r1, col_r2, col_r3, col_r4 = st.columns(4)
     with col_r1:
-        st.metric("Weekly", f"${weekly_time_savings:,.0f}")
+        st.metric("Weekly", f"${weekly_savings:,.0f}")
     with col_r2:
-        st.metric("Monthly", f"${monthly_time_savings:,.0f}")
+        st.metric("Monthly", f"${monthly_savings:,.0f}")
     with col_r3:
         st.metric("Contractor Savings", f"${contractor_savings:,.0f}/mo")
     with col_r4:
-        st.metric("**Total Monthly**", f"${total_monthly_savings:,.0f}")
+        st.metric("**Total Monthly**", f"${total_savings:,.0f}")
     
-    # Conservative Estimate
     st.info(f"""
     💰 **Even with conservative estimates (50% of these numbers):**
-    - **Monthly savings:** ${total_monthly_savings/2:,.0f}
-    - **Annual savings:** ${total_monthly_savings/2*12:,.0f}
+    - **Monthly savings:** ${total_savings/2:,.0f}
+    - **Annual savings:** ${total_savings/2*12:,.0f}
     - **System cost:** $0/month
     - **ROI:** Immediate
     """)
@@ -852,7 +775,79 @@ elif st.session_state.current_page == 'team':
             time.sleep(1)
             st.rerun()
 
-elif st.session_state.current_page == 'jobs' or st.session_state.current_page == 'assignments':
+elif st.session_state.current_page == 'explorer':
+    # Unit Explorer
+    st.markdown("""
+    <div class="hct-header">
+        <h1>🏢 Unit Explorer</h1>
+        <h3>Track Complete Unit History & Equipment</h3>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Connect to database
+    conn = sqlite3.connect('hghi_tech.db')
+    
+    # Property selection
+    properties = pd.read_sql_query("SELECT id, name FROM buildings ORDER BY name", conn)
+    selected_property = st.selectbox("Select Property", properties['name'])
+    property_id = properties[properties['name'] == selected_property].iloc[0]['id']
+    
+    # Unit selection
+    units = pd.read_sql_query("SELECT id, unit_number, resident_name FROM units WHERE building_id=? ORDER BY unit_number", 
+                             conn, params=(property_id,))
+    
+    if not units.empty:
+        selected_unit = st.selectbox("Select Unit", units['unit_number'])
+        unit_id = units[units['unit_number'] == selected_unit].iloc[0]['id']
+        
+        # Get unit details
+        unit_details = units[units['id'] == unit_id].iloc[0]
+        
+        st.markdown(f"""
+        <div style="background: #f8fafc; padding: 15px; border-radius: 10px; margin-bottom: 20px;">
+            <h4>🏠 Unit {unit_details['unit_number']}</h4>
+            <p><strong>Resident:</strong> {unit_details['resident_name']}</p>
+            <p><strong>Property:</strong> {selected_property}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Equipment for this unit
+        equipment = pd.read_sql_query("SELECT equipment_type, serial_number, manufacturer, installation_date, status, notes FROM equipment WHERE unit_id=?", 
+                                     conn, params=(unit_id,))
+        
+        if not equipment.empty:
+            st.subheader("🔧 Equipment")
+            for _, eq in equipment.iterrows():
+                with st.expander(f"{eq['equipment_type']} - {eq['serial_number']}"):
+                    col1, col2 = st.columns(2)
+                    col1.write(f"**Manufacturer:** {eq['manufacturer']}")
+                    col1.write(f"**Installed:** {eq['installation_date']}")
+                    col2.write(f"**Status:** {eq['status'].title()}")
+                    st.write(f"**Notes:** {eq['notes'] or 'No notes'}")
+        else:
+            st.info("No equipment recorded for this unit")
+        
+        # Sample service history
+        st.subheader("📋 Service History")
+        
+        sample_history = [
+            {"date": "2024-01-15", "service": "Fiber Installation", "technician": "Mike Rodriguez", "ticket": "T-108950"},
+            {"date": "2024-02-20", "service": "Router Replacement", "technician": "Sarah Chen", "ticket": "T-109020"},
+            {"date": "2024-03-10", "service": "Speed Test", "technician": "Mike Rodriguez", "ticket": "T-109035"},
+        ]
+        
+        for visit in sample_history:
+            with st.container():
+                col1, col2, col3 = st.columns([2, 2, 1])
+                col1.write(f"**{visit['date']}**")
+                col1.write(f"{visit['service']}")
+                col2.write(f"👷 {visit['technician']}")
+                col3.write(f"📋 {visit['ticket']}")
+                st.divider()
+    
+    conn.close()
+
+elif st.session_state.current_page in ['jobs', 'assignments']:
     # My Jobs (for technicians)
     st.markdown(f"""
     <div class="hct-header">
@@ -861,7 +856,6 @@ elif st.session_state.current_page == 'jobs' or st.session_state.current_page ==
     </div>
     """, unsafe_allow_html=True)
     
-    # Sample jobs
     jobs = [
         {"id": "T-109040", "property": "ARVA1850", "unit": "C-508", "issue": "No internet", "priority": "🔴 URGENT", "status": "Assigned"},
         {"id": "T-109038", "property": "Tysons Plaza", "unit": "B-205", "issue": "Router replacement", "priority": "🟡 NORMAL", "status": "In Progress"},
@@ -899,7 +893,6 @@ elif st.session_state.current_page == 'pay':
     </div>
     """, unsafe_allow_html=True)
     
-    # Sample pay data
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Hourly Rate", f"${user['hourly_rate']}/hr")
@@ -910,7 +903,6 @@ elif st.session_state.current_page == 'pay':
     
     st.divider()
     
-    # Time entries
     st.markdown("### ⏰ Recent Hours")
     time_data = [
         {"date": "Today", "hours": "6.5", "earnings": f"${6.5 * user['hourly_rate']:.2f}"},
@@ -924,6 +916,32 @@ elif st.session_state.current_page == 'pay':
         col_t1.write(f"**{entry['date']}**")
         col_t2.write(f"{entry['hours']} hours")
         col_t3.write(f"{entry['earnings']}")
+
+elif st.session_state.current_page == 'units':
+    # My Units (for technicians)
+    st.markdown(f"""
+    <div class="hct-header">
+        <h1>🏢 My Units</h1>
+        <h3>Units assigned to {user['name']}</h3>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    my_units = [
+        {"property": "ARVA1850", "units": ["A-101", "B-205", "C-508"], "last_visit": "Yesterday"},
+        {"property": "Tysons Plaza", "units": ["A-302", "B-110"], "last_visit": "2 days ago"},
+        {"property": "Ballston", "units": ["C-401"], "last_visit": "Last week"},
+    ]
+    
+    for location in my_units:
+        with st.expander(f"🏢 {location['property']} - {len(location['units'])} units"):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                for unit in location['units']:
+                    st.write(f"• Unit {unit}")
+            with col2:
+                st.write(f"📅 {location['last_visit']}")
+                if st.button(f"📝 Add Note", key=f"note_{location['property']}"):
+                    st.info(f"Add note for {location['property']}")
 
 # Footer
 st.divider()
