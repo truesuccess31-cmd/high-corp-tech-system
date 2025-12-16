@@ -1,10 +1,11 @@
 # ============================================================
-# HGHI TECH FIELD MANAGEMENT SYSTEM (Streamlit)
+# HGHI TECH FIELD MANAGEMENT SYSTEM (Streamlit) - ENHANCED
 # - Login + Contractor Registration (pending approval)
 # - Time Clock (Clock in/out)
 # - Ticket Manager (Email parser + manual ticket)
 # - Unit Explorer (service history + equipment + notes)
 # - DeepSeek AI integration (email parsing, reports, assistant)
+# - ENHANCED: Session timeout, audit logs, backups, batch ops
 #
 # IMPORTANT:
 # - Put DeepSeek key in Streamlit Secrets:
@@ -21,6 +22,9 @@ import re
 import base64
 import io
 import requests
+import shutil
+import os
+import string
 from datetime import datetime, timedelta
 from PIL import Image
 
@@ -32,7 +36,11 @@ OWNER_NAME = "Darrell Kelly"
 SUPERVISORS = ["Brandon Alves", "Andre Ampey"]
 
 DB_PATH = "field_management.db"
+BACKUP_DIR = "database_backups"
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+# Session timeout (minutes)
+SESSION_TIMEOUT_MINUTES = 30
 
 # Read secrets safely
 DEEPSEEK_API_KEY = ""
@@ -59,6 +67,131 @@ def safe_float(x, default=0.0):
         return float(x)
     except Exception:
         return default
+
+def export_to_excel(data_df, filename_prefix="report"):
+    """Export DataFrame to Excel file"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        data_df.to_excel(writer, index=False, sheet_name='Data')
+    output.seek(0)
+    return output
+
+def backup_database():
+    """Create backup of SQLite database"""
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR)
+    
+    backup_name = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    backup_path = os.path.join(BACKUP_DIR, backup_name)
+    shutil.copy2(DB_PATH, backup_path)
+    
+    # Keep only last 10 backups
+    backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith('.db')])
+    if len(backups) > 10:
+        for old_backup in backups[:-10]:
+            os.remove(os.path.join(BACKUP_DIR, old_backup))
+    
+    return backup_path
+
+def restore_database(backup_file):
+    """Restore database from backup"""
+    try:
+        shutil.copy2(backup_file, DB_PATH)
+        return True, "Database restored successfully"
+    except Exception as e:
+        return False, f"Restore failed: {str(e)}"
+
+def validate_password(password):
+    """Check password complexity requirements"""
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters"
+    
+    has_upper = any(c.isupper() for c in password)
+    has_lower = any(c.islower() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    has_special = any(c in string.punctuation for c in password)
+    
+    if not (has_upper and has_lower and has_digit and has_special):
+        return False, "Password must include uppercase, lowercase, digit, and special character"
+    
+    return True, "Password valid"
+
+def validate_parsed_data(data: dict) -> dict:
+    """Validate and clean parsed email data"""
+    required = ["issue_description"]
+    for field in required:
+        if field not in data or not str(data[field]).strip():
+            data[field] = "Not specified"
+    
+    # Clean priority
+    priority = str(data.get("priority", "normal")).lower()
+    if priority not in ["urgent", "high", "normal"]:
+        data["priority"] = "normal"
+    else:
+        data["priority"] = priority
+    
+    # Clean ticket ID format
+    if "ticket_id" in data and data["ticket_id"]:
+        data["ticket_id"] = data["ticket_id"].strip().upper()
+    
+    return data
+
+def log_audit(user_id, action, details=""):
+    """Log audit trail entry"""
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO audit_log (user_id, action, details, timestamp)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, action, details, now_str()))
+    conn.commit()
+    conn.close()
+
+def check_session_timeout():
+    """Check if session has timed out"""
+    if "last_activity" not in st.session_state:
+        st.session_state.last_activity = datetime.now()
+        return False
+    
+    elapsed = datetime.now() - st.session_state.last_activity
+    if elapsed.total_seconds() > SESSION_TIMEOUT_MINUTES * 60:
+        st.session_state.logged_in = False
+        st.session_state.user = None
+        st.session_state.clocked_in = False
+        st.session_state.current_time_entry = None
+        st.success("Session timed out due to inactivity")
+        time.sleep(1)
+        st.rerun()
+    
+    st.session_state.last_activity = datetime.now()
+    return False
+
+def add_indexes():
+    """Add performance indexes to database"""
+    conn = connect_db()
+    c = conn.cursor()
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_time_contractor ON time_entries(contractor_id)",
+        "CREATE INDEX IF NOT EXISTS idx_work_orders_status ON work_orders(status)",
+        "CREATE INDEX IF NOT EXISTS idx_work_orders_contractor ON work_orders(contractor_id)",
+        "CREATE INDEX IF NOT EXISTS idx_units_building ON units(building_id)",
+        "CREATE INDEX IF NOT EXISTS idx_service_unit ON service_history(unit_id)",
+        "CREATE INDEX IF NOT EXISTS idx_service_date ON service_history(service_date)",
+        "CREATE INDEX IF NOT EXISTS idx_contractors_status ON contractors(status)",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)",
+    ]
+    
+    for idx in indexes:
+        try:
+            c.execute(idx)
+        except Exception as e:
+            print(f"Index creation failed: {e}")
+    
+    conn.commit()
+    conn.close()
 
 # ----------------------------
 # SIMPLE FALLBACK PARSER
@@ -90,7 +223,7 @@ def simple_parse_email(email_text: str):
         # fallback: use first 200 chars
         results["issue_description"] = email_text.strip()[:200]
 
-    return {"success": True, "data": results, "source": "simple_parser"}
+    return validate_parsed_data(results)
 
 # ----------------------------
 # DEEPSEEK AI FUNCTIONS
@@ -159,7 +292,8 @@ Return JSON only. No markdown.
 
     try:
         parsed = json.loads(m.group(0))
-        return {"success": True, "data": parsed, "source": "deepseek_ai"}
+        validated = validate_parsed_data(parsed)
+        return {"success": True, "data": validated, "source": "deepseek_ai"}
     except Exception:
         return simple_parse_email(email_text)
 
@@ -189,6 +323,65 @@ Use headings and bullet points.
         max_tokens=900,
     )
     return content if content else f"AI report failed: {err}"
+
+# ----------------------------
+# BATCH OPERATIONS
+# ----------------------------
+def batch_assign_tickets(ticket_ids, contractor_id):
+    """Assign multiple tickets to a contractor"""
+    conn = connect_db()
+    c = conn.cursor()
+    success_count = 0
+    
+    for ticket_id in ticket_ids:
+        try:
+            c.execute("""
+                UPDATE work_orders 
+                SET contractor_id=?, assigned_date=?, status='in_progress'
+                WHERE ticket_id=?
+            """, (contractor_id, now_str(), ticket_id.strip()))
+            success_count += 1
+            
+            # Log audit
+            log_audit(
+                st.session_state.user["id"],
+                "BATCH_ASSIGN",
+                f"Assigned ticket {ticket_id} to contractor {contractor_id}"
+            )
+        except Exception as e:
+            print(f"Failed to assign {ticket_id}: {e}")
+    
+    conn.commit()
+    conn.close()
+    return success_count
+
+def batch_approve_time_entries(entry_ids):
+    """Approve multiple time entries"""
+    conn = connect_db()
+    c = conn.cursor()
+    success_count = 0
+    
+    for entry_id in entry_ids:
+        try:
+            c.execute("""
+                UPDATE time_entries 
+                SET approved=1, verified=1
+                WHERE id=?
+            """, (entry_id,))
+            success_count += 1
+            
+            # Log audit
+            log_audit(
+                st.session_state.user["id"],
+                "BATCH_APPROVE_TIME",
+                f"Approved time entry {entry_id}"
+            )
+        except Exception as e:
+            print(f"Failed to approve entry {entry_id}: {e}")
+    
+    conn.commit()
+    conn.close()
+    return success_count
 
 # ----------------------------
 # DATABASE INIT + SEED USERS
@@ -356,22 +549,41 @@ def init_database():
     )
     """)
 
+    # AUDIT LOG TABLE (NEW)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        details TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES contractors(id)
+    )
+    """)
+
     # ----------------------------
     # SEED: REAL TEAM USERS
     # ----------------------------
+    # Store demo credentials in environment-friendly way
+    demo_users = {
+        "darrell@hghitech.com": "owner123",
+        "brandon@hghitech.com": "super123", 
+        "andre@hghitech.com": "super123",
+        "walter@hghitech.com": "tech123",
+        "rasheed@hghitech.com": "tech123",
+        "dale@hghitech.com": "tech123",
+        "tuesuccess3@gmail.com": "admin123"
+    }
+    
     users = [
         # name, email, password, role, status, rate
-        ("Darrell Kelly",  "darrell@hghitech.com",  "owner123", "owner",      "active", 0),
-
-        ("Brandon Alves",  "brandon@hghitech.com",  "super123", "supervisor", "active", 0),
-        ("Andre Ampey",    "andre@hghitech.com",    "super123", "supervisor", "active", 0),
-
-        ("Walter Chandler","walter@hghitech.com",   "tech123",  "technician", "active", 40.00),
-        ("Rasheed Rouse",  "rasheed@hghitech.com",  "tech123",  "technician", "active", 40.00),
-        ("Dale Vester",    "dale@hghitech.com",     "tech123",  "technician", "active", 40.00),
-
-        # optional admin (keep if you want)
-        ("Admin",          "tuesuccess3@gmail.com", "admin123", "admin",      "active", 0),
+        ("Darrell Kelly",  "darrell@hghitech.com",  demo_users.get("darrell@hghitech.com", "owner123"), "owner",      "active", 0),
+        ("Brandon Alves",  "brandon@hghitech.com",  demo_users.get("brandon@hghitech.com", "super123"), "supervisor", "active", 0),
+        ("Andre Ampey",    "andre@hghitech.com",    demo_users.get("andre@hghitech.com", "super123"),   "supervisor", "active", 0),
+        ("Walter Chandler","walter@hghitech.com",   demo_users.get("walter@hghitech.com", "tech123"),   "technician", "active", 40.00),
+        ("Rasheed Rouse",  "rasheed@hghitech.com",  demo_users.get("rasheed@hghitech.com", "tech123"),  "technician", "active", 40.00),
+        ("Dale Vester",    "dale@hghitech.com",     demo_users.get("dale@hghitech.com", "tech123"),     "technician", "active", 40.00),
+        ("Admin",          "tuesuccess3@gmail.com", demo_users.get("tuesuccess3@gmail.com", "admin123"), "admin",      "active", 0),
     ]
 
     for name, email, password, role, status, rate in users:
@@ -404,6 +616,9 @@ def init_database():
 
     conn.commit()
     conn.close()
+    
+    # Add indexes after table creation
+    add_indexes()
 
 # ----------------------------
 # AUTH / USERS
@@ -427,6 +642,9 @@ def verify_login(email, password):
         return None, "Account pending approval. Contact supervisor."
     if user["status"] == "inactive":
         return None, "Account inactive. Contact supervisor."
+    
+    # Log successful login
+    log_audit(user["id"], "LOGIN", f"User logged in from IP")
     return user, "Success"
 
 def register_contractor(name, email, password, phone, hourly_rate):
@@ -439,6 +657,12 @@ def register_contractor(name, email, password, phone, hourly_rate):
     if c.fetchone()[0] > 0:
         conn.close()
         return False, "Email already registered"
+
+    # Validate password complexity
+    is_valid, msg = validate_password(password)
+    if not is_valid:
+        conn.close()
+        return False, msg
 
     rate = safe_float(hourly_rate, 0)
     if rate < 15 or rate > 100:
@@ -547,6 +771,38 @@ def get_unit_notes(unit_id):
     conn.close()
     return df
 
+# ----------------------------
+# REAL-TIME NOTIFICATIONS
+# ----------------------------
+def get_realtime_updates(user_id):
+    """Check for new tickets, messages, approvals"""
+    conn = connect_db()
+    
+    # Get unread notifications
+    c = conn.cursor()
+    c.execute("""
+        SELECT COUNT(*) as unread_count 
+        FROM notifications 
+        WHERE user_id=? AND read=0
+    """, (user_id,))
+    unread = c.fetchone()[0]
+    
+    # Get recent tickets assigned
+    c.execute("""
+        SELECT COUNT(*) as new_tickets
+        FROM work_orders 
+        WHERE contractor_id=? AND status='open' 
+        AND assigned_date > datetime('now', '-1 hour')
+    """, (user_id,))
+    new_tickets = c.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        "unread_notifications": unread,
+        "new_tickets_last_hour": new_tickets
+    }
+
 # ============================================================
 # STREAMLIT APP START
 # ============================================================
@@ -577,6 +833,10 @@ if "current_page" not in st.session_state:
     st.session_state.current_page = "dashboard"
 if "ai_enabled" not in st.session_state:
     st.session_state.ai_enabled = bool(DEEPSEEK_API_KEY)
+if "last_activity" not in st.session_state:
+    st.session_state.last_activity = datetime.now()
+if "real_time_updates" not in st.session_state:
+    st.session_state.real_time_updates = {"last_check": datetime.now()}
 
 # IMPORTANT: These keys are NOT bound to widgets directly
 # so we can safely change them from demo buttons.
@@ -584,6 +844,9 @@ if "prefill_email" not in st.session_state:
     st.session_state.prefill_email = ""
 if "prefill_password" not in st.session_state:
     st.session_state.prefill_password = ""
+
+# Check session timeout
+check_session_timeout()
 
 # ----------------------------
 # STYLE
@@ -622,6 +885,11 @@ st.markdown("""
     border-radius: 8px;
     padding: 12px;
 }
+/* Mobile responsive */
+@media (max-width: 768px) {
+    .mobile-stack { flex-direction: column !important; }
+    .mobile-full { width: 100% !important; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -648,15 +916,13 @@ if not st.session_state.logged_in:
                 email = st.text_input("Email")
                 phone = st.text_input("Phone")
                 hourly_rate = st.number_input("Desired Hourly Rate ($)", min_value=15.0, max_value=100.0, value=35.0, step=0.5)
-                password = st.text_input("Password (min 8 chars)", type="password")
+                password = st.text_input("Password (min 8 chars, include uppercase, lowercase, number, special)", type="password")
                 confirm = st.text_input("Confirm Password", type="password")
                 submit = st.form_submit_button("Submit Registration", use_container_width=True)
 
             if submit:
                 if not all([name, email, phone, password, confirm]):
                     st.error("Please fill all fields.")
-                elif len(password) < 8:
-                    st.error("Password must be at least 8 characters.")
                 elif password != confirm:
                     st.error("Passwords do not match.")
                 else:
@@ -688,6 +954,7 @@ if not st.session_state.logged_in:
                     if user:
                         st.session_state.logged_in = True
                         st.session_state.user = user
+                        st.session_state.last_activity = datetime.now()
 
                         # Check if clocked in already
                         conn = connect_db()
@@ -722,7 +989,7 @@ if not st.session_state.logged_in:
             st.caption("Demo accounts (click to autofill):")
 
             # ✅ FIXED: no session_state crash because we prefill into different keys
-            demo_cols = st.columns(3)
+            demo_cols = st.columns([1, 1, 1])
             with demo_cols[0]:
                 if st.button("Owner Demo", use_container_width=True):
                     st.session_state.prefill_email = "darrell@hghitech.com"
@@ -750,6 +1017,17 @@ user = st.session_state.user
 role = user["role"]
 role_class = f"role-{role}" if role in ["owner", "supervisor", "technician", "admin"] else "role-pending"
 
+# Update session activity
+st.session_state.last_activity = datetime.now()
+
+# Check for real-time updates (every 30 seconds)
+current_time = datetime.now()
+last_check = st.session_state.real_time_updates.get("last_check", current_time)
+if (current_time - last_check).total_seconds() > 30:
+    updates = get_realtime_updates(user["id"])
+    st.session_state.real_time_updates = updates
+    st.session_state.real_time_updates["last_check"] = current_time
+
 # ----------------------------
 # SIDEBAR
 # ----------------------------
@@ -775,12 +1053,7 @@ with st.sidebar:
     st.divider()
 
     # Notifications
-    conn = connect_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND read=0", (user["id"],))
-    unread = c.fetchone()[0]
-    conn.close()
-
+    unread = st.session_state.real_time_updates.get("unread_notifications", 0)
     if unread:
         st.info(f"📢 Notifications: {unread}")
 
@@ -796,6 +1069,14 @@ with st.sidebar:
             c = conn.cursor()
             c.execute("UPDATE time_entries SET clock_out=CURRENT_TIMESTAMP, hours_worked=? WHERE id=?",
                       (hours, st.session_state.current_time_entry["id"]))
+            
+            # Log audit
+            log_audit(
+                user["id"],
+                "CLOCK_OUT",
+                f"Clocked out after {hours:.2f} hours"
+            )
+            
             conn.commit()
             conn.close()
             st.session_state.clocked_in = False
@@ -809,6 +1090,14 @@ with st.sidebar:
             c = conn.cursor()
             c.execute("INSERT INTO time_entries (contractor_id, clock_in, location) VALUES (?, CURRENT_TIMESTAMP, ?)",
                       (user["id"], "Field Location"))
+            
+            # Log audit
+            log_audit(
+                user["id"],
+                "CLOCK_IN",
+                "Clocked in at field location"
+            )
+            
             conn.commit()
             c.execute("""
                 SELECT id, clock_in FROM time_entries
@@ -836,7 +1125,9 @@ with st.sidebar:
             ("dashboard", "📊 Dashboard"),
             ("ticket", "📋 Ticket Manager"),
             ("unit", "🏢 Unit Explorer"),
+            ("batch", "⚡ Batch Operations"),
             ("ai", "🤖 AI Assistant"),
+            ("admin", "⚙️ Admin Tools"),
         ]
     else:
         nav = [
@@ -852,6 +1143,9 @@ with st.sidebar:
 
     st.divider()
     if st.button("🚪 Logout", use_container_width=True):
+        # Log audit
+        log_audit(user["id"], "LOGOUT", "User logged out")
+        
         st.session_state.logged_in = False
         st.session_state.user = None
         st.session_state.clocked_in = False
@@ -896,6 +1190,15 @@ if page == "dashboard":
             FROM work_orders
         """, conn).iloc[0]
 
+        # Recent audit logs
+        audit_logs = pd.read_sql_query("""
+            SELECT a.action, a.details, a.timestamp, c.name as user_name
+            FROM audit_log a
+            JOIN contractors c ON a.user_id = c.id
+            ORDER BY a.timestamp DESC
+            LIMIT 5
+        """, conn)
+
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Active Techs", int(team_stats["active_techs"] or 0))
         col2.metric("Pending Approvals", int(team_stats["pending_approvals"] or 0))
@@ -903,6 +1206,21 @@ if page == "dashboard":
         col4.metric("Completed Today", int(work_stats["completed_today"] or 0))
 
         st.divider()
+        
+        # Recent Activity (Audit Logs)
+        with st.expander("📜 Recent Activity Logs", expanded=True):
+            if not audit_logs.empty:
+                for _, r in audit_logs.iterrows():
+                    st.markdown(f"""
+                    <div style="padding:8px; border-bottom:1px solid #e5e7eb;">
+                      <b>{r['action']}</b> • {r['user_name']}<br/>
+                      <small>{r['details'] or ''}</small><br/>
+                      <small style="color:#6b7280;">{r['timestamp']}</small>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No recent activity")
+
         st.subheader("📋 Recent Tickets")
 
         recent = pd.read_sql_query("""
@@ -951,6 +1269,34 @@ if page == "dashboard":
         conn.close()
         col3.metric("Active Jobs", int(active_jobs))
 
+        # Recent work
+        st.divider()
+        st.subheader("Recent Work History")
+        conn = connect_db()
+        recent_work = pd.read_sql_query("""
+            SELECT wo.ticket_id, wo.description, wo.completed_date,
+                   b.name as property, u.unit_number
+            FROM work_orders wo
+            JOIN units u ON wo.unit_id = u.id
+            JOIN buildings b ON u.building_id = b.id
+            WHERE wo.contractor_id=? AND wo.status='completed'
+            ORDER BY wo.completed_date DESC
+            LIMIT 5
+        """, conn, params=(user["id"],))
+        conn.close()
+        
+        if not recent_work.empty:
+            for _, r in recent_work.iterrows():
+                st.markdown(f"""
+                <div style="padding:10px; border:1px solid #e5e7eb; border-radius:8px; margin-bottom:8px;">
+                  <b>{r['ticket_id']}</b> • {r['property']} - {r['unit_number']}<br/>
+                  <small>{str(r['description'])[:100]}...</small><br/>
+                  <small style="color:#6b7280;">Completed: {r['completed_date']}</small>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("No completed work yet")
+
 # ============================================================
 # TICKET MANAGER
 # ============================================================
@@ -970,9 +1316,9 @@ elif page == "ticket":
             if st.button("Parse Email", type="primary", disabled=not email_text.strip()):
                 with st.spinner("Parsing..."):
                     result = deepseek_parse_email(email_text) if use_ai else simple_parse_email(email_text)
-                    data = result["data"]
+                    data = result["data"] if isinstance(result, dict) else result
 
-                st.success(f"Parsed via: {result['source']}")
+                st.success(f"Parsed via: {result.get('source', 'simple_parser')}" if isinstance(result, dict) else "Parsed via simple parser")
                 st.json(data)
 
                 # Create ticket form
@@ -1034,6 +1380,13 @@ elif page == "ticket":
                         VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
                     """, (ticket_id, unit_id, contractor_id, description, priority, email_to_save, now_str() if contractor_id else None))
 
+                    # Log audit
+                    log_audit(
+                        user["id"],
+                        "CREATE_TICKET",
+                        f"Created ticket {ticket_id} for unit {selected_unit}"
+                    )
+
                     conn.commit()
                     conn.close()
                     st.success(f"✅ Created work order {ticket_id}")
@@ -1075,6 +1428,14 @@ elif page == "ticket":
                     INSERT INTO work_orders (ticket_id, unit_id, contractor_id, description, priority, status, assigned_date)
                     VALUES (?, ?, ?, ?, ?, 'open', ?)
                 """, (ticket_id, unit_id, contractor_id, description, priority, now_str() if contractor_id else None))
+                
+                # Log audit
+                log_audit(
+                    user["id"],
+                    "CREATE_TICKET",
+                    f"Created manual ticket {ticket_id}"
+                )
+                
                 conn.commit()
                 conn.close()
                 st.success(f"✅ Ticket created: {ticket_id}")
@@ -1106,6 +1467,222 @@ elif page == "ticket":
                   <div style="margin-top:6px;color:#374151;">{str(r['description'])[:200]}</div>
                 </div>
                 """, unsafe_allow_html=True)
+
+# ============================================================
+# BATCH OPERATIONS (NEW)
+# ============================================================
+elif page == "batch" and role in ["owner", "supervisor", "admin"]:
+    st.subheader("⚡ Batch Operations")
+    
+    tab1, tab2, tab3 = st.tabs(["📋 Bulk Assign Tickets", "⏱️ Bulk Approve Time", "📤 Bulk Export"])
+    
+    with tab1:
+        st.markdown("### Bulk Ticket Assignment")
+        
+        conn = connect_db()
+        
+        # Get unassigned tickets
+        unassigned = pd.read_sql_query("""
+            SELECT wo.ticket_id, wo.description, wo.created_date,
+                   b.name as property, u.unit_number
+            FROM work_orders wo
+            JOIN units u ON wo.unit_id = u.id
+            JOIN buildings b ON u.building_id = b.id
+            WHERE wo.contractor_id IS NULL AND wo.status = 'open'
+            ORDER BY wo.created_date DESC
+        """, conn)
+        
+        # Get available technicians
+        techs = pd.read_sql_query("""
+            SELECT id, name, hourly_rate 
+            FROM contractors 
+            WHERE status='active' AND role='technician'
+            ORDER BY name
+        """, conn)
+        
+        if unassigned.empty:
+            st.info("No unassigned tickets found.")
+        else:
+            # Multiselect for tickets
+            ticket_options = unassigned.apply(
+                lambda x: f"{x['ticket_id']} - {x['property']} {x['unit_number']} ({x['created_date'][:10]})", 
+                axis=1
+            ).tolist()
+            
+            selected_tickets = st.multiselect(
+                "Select Tickets to Assign",
+                options=ticket_options,
+                default=ticket_options[:3] if len(ticket_options) > 3 else ticket_options
+            )
+            
+            # Extract ticket IDs
+            ticket_ids = [t.split(" - ")[0] for t in selected_tickets]
+            
+            # Select technician
+            tech_options = {f"{row['name']} (${row['hourly_rate']}/hr)": row['id'] for _, row in techs.iterrows()}
+            selected_tech_name = st.selectbox("Assign to Technician", list(tech_options.keys()))
+            tech_id = tech_options[selected_tech_name]
+            
+            if st.button("🔄 Assign Selected Tickets", type="primary", disabled=not selected_tickets):
+                with st.spinner(f"Assigning {len(ticket_ids)} tickets..."):
+                    success_count = batch_assign_tickets(ticket_ids, tech_id)
+                    
+                st.success(f"✅ Successfully assigned {success_count} out of {len(ticket_ids)} tickets")
+                time.sleep(1)
+                st.rerun()
+            
+            # Show selected tickets
+            if selected_tickets:
+                st.markdown("### Selected Tickets")
+                for ticket in selected_tickets:
+                    st.markdown(f"- {ticket}")
+        
+        conn.close()
+    
+    with tab2:
+        st.markdown("### Bulk Time Entry Approval")
+        
+        conn = connect_db()
+        
+        # Get pending time entries
+        pending_time = pd.read_sql_query("""
+            SELECT te.id, te.clock_in, te.clock_out, te.hours_worked, te.location,
+                   c.name as contractor_name, c.hourly_rate
+            FROM time_entries te
+            JOIN contractors c ON te.contractor_id = c.id
+            WHERE te.approved = 0 AND te.clock_out IS NOT NULL
+            ORDER BY te.clock_in DESC
+        """, conn)
+        
+        if pending_time.empty:
+            st.info("No pending time entries for approval.")
+        else:
+            # Calculate estimated pay
+            pending_time["estimated_pay"] = pending_time["hours_worked"] * pending_time["hourly_rate"]
+            total_hours = pending_time["hours_worked"].sum()
+            total_pay = pending_time["estimated_pay"].sum()
+            
+            st.metric("Total Pending Hours", f"{total_hours:.2f}")
+            st.metric("Total Estimated Pay", f"${total_pay:.2f}")
+            
+            # Multiselect for time entries
+            time_options = pending_time.apply(
+                lambda x: f"ID {x['id']}: {x['contractor_name']} - {x['hours_worked']:.2f}h (${x['estimated_pay']:.2f}) - {x['clock_in'][:10]}", 
+                axis=1
+            ).tolist()
+            
+            selected_entries = st.multiselect(
+                "Select Time Entries to Approve",
+                options=time_options,
+                default=time_options[:5] if len(time_options) > 5 else time_options
+            )
+            
+            # Extract entry IDs
+            entry_ids = [int(t.split("ID ")[1].split(":")[0]) for t in selected_entries]
+            
+            if st.button("✅ Approve Selected Time Entries", type="primary", disabled=not selected_entries):
+                with st.spinner(f"Approving {len(entry_ids)} time entries..."):
+                    success_count = batch_approve_time_entries(entry_ids)
+                    
+                st.success(f"✅ Successfully approved {success_count} out of {len(entry_ids)} time entries")
+                time.sleep(1)
+                st.rerun()
+            
+            # Show preview
+            if selected_entries:
+                st.markdown("### Selected Time Entries")
+                for entry in selected_entries:
+                    st.markdown(f"- {entry}")
+        
+        conn.close()
+    
+    with tab3:
+        st.markdown("### Bulk Data Export")
+        
+        export_options = st.multiselect(
+            "Select Data to Export",
+            ["Work Orders", "Time Entries", "Service History", "Contractors", "Equipment"],
+            default=["Work Orders", "Time Entries"]
+        )
+        
+        col1, col2 = st.columns(2)
+        start_date = col1.date_input("Start Date", datetime.now() - timedelta(days=30))
+        end_date = col2.date_input("End Date", datetime.now())
+        
+        if st.button("📥 Export Selected Data", type="primary"):
+            conn = connect_db()
+            export_data = {}
+            
+            with st.spinner("Exporting data..."):
+                if "Work Orders" in export_options:
+                    work_df = pd.read_sql_query("""
+                        SELECT wo.*, b.name as property, u.unit_number, c.name as contractor_name
+                        FROM work_orders wo
+                        JOIN units u ON wo.unit_id = u.id
+                        JOIN buildings b ON u.building_id = b.id
+                        LEFT JOIN contractors c ON wo.contractor_id = c.id
+                        WHERE DATE(wo.created_date) BETWEEN ? AND ?
+                    """, conn, params=(str(start_date), str(end_date)))
+                    export_data["Work_Orders"] = work_df
+                
+                if "Time Entries" in export_options:
+                    time_df = pd.read_sql_query("""
+                        SELECT te.*, c.name as contractor_name, c.hourly_rate
+                        FROM time_entries te
+                        JOIN contractors c ON te.contractor_id = c.id
+                        WHERE DATE(te.clock_in) BETWEEN ? AND ?
+                    """, conn, params=(str(start_date), str(end_date)))
+                    export_data["Time_Entries"] = time_df
+                
+                if "Service History" in export_options:
+                    service_df = pd.read_sql_query("""
+                        SELECT sh.*, b.name as property, u.unit_number, c.name as contractor_name
+                        FROM service_history sh
+                        JOIN units u ON sh.unit_id = u.id
+                        JOIN buildings b ON u.building_id = b.id
+                        JOIN contractors c ON sh.contractor_id = c.id
+                        WHERE DATE(sh.service_date) BETWEEN ? AND ?
+                    """, conn, params=(str(start_date), str(end_date)))
+                    export_data["Service_History"] = service_df
+                
+                if "Contractors" in export_options:
+                    contractors_df = pd.read_sql_query("SELECT * FROM contractors", conn)
+                    export_data["Contractors"] = contractors_df
+                
+                if "Equipment" in export_options:
+                    equipment_df = pd.read_sql_query("""
+                        SELECT e.*, b.name as property, u.unit_number
+                        FROM equipment e
+                        JOIN units u ON e.unit_id = u.id
+                        JOIN buildings b ON u.building_id = b.id
+                    """, conn)
+                    export_data["Equipment"] = equipment_df
+            
+            conn.close()
+            
+            # Create Excel file with multiple sheets
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                for sheet_name, df in export_data.items():
+                    if not df.empty:
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            output.seek(0)
+            
+            # Download button
+            st.download_button(
+                label="📥 Download Excel File",
+                data=output,
+                file_name=f"hghi_export_{start_date}_{end_date}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            # Log audit
+            log_audit(
+                user["id"],
+                "DATA_EXPORT",
+                f"Exported {len(export_data)} datasets"
+            )
 
 # ============================================================
 # UNIT EXPLORER
@@ -1157,6 +1734,15 @@ elif page == "unit":
                 if hist.empty:
                     st.info("No service history yet.")
                 else:
+                    # Export button
+                    excel_data = export_to_excel(hist, f"service_history_{unit_number}")
+                    st.download_button(
+                        label="📥 Export to Excel",
+                        data=excel_data,
+                        file_name=f"service_history_{unit_number}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    
                     for _, v in hist.iterrows():
                         st.markdown(f"""
                         <div class="ticket-card">
@@ -1203,6 +1789,14 @@ elif page == "unit":
                                 INSERT INTO equipment (unit_id, equipment_type, serial_number, manufacturer, model, status, notes)
                                 VALUES (?, ?, ?, ?, ?, ?, ?)
                             """, (unit_id, equip_type, serial.strip(), manu.strip(), model.strip(), status, notes.strip()))
+                            
+                            # Log audit
+                            log_audit(
+                                user["id"],
+                                "ADD_EQUIPMENT",
+                                f"Added {equip_type} {serial} to unit {unit_number}"
+                            )
+                            
                             conn.commit()
                             st.success("Equipment added.")
                             time.sleep(0.6)
@@ -1239,6 +1833,14 @@ elif page == "unit":
                             INSERT INTO unit_notes (unit_id, contractor_id, note_type, content)
                             VALUES (?, ?, ?, ?)
                         """, (unit_id, user["id"], note_type, content.strip()))
+                        
+                        # Log audit
+                        log_audit(
+                            user["id"],
+                            "ADD_NOTE",
+                            f"Added {note_type} note to unit {unit_number}"
+                        )
+                        
                         conn.commit()
                         st.success("Note added.")
                         time.sleep(0.6)
@@ -1281,6 +1883,13 @@ elif page == "unit":
                             UPDATE equipment SET last_service_date=CURRENT_DATE
                             WHERE unit_id=? AND serial_number=?
                         """, (unit_id, serial_ref.strip()))
+                    
+                    # Log audit
+                    log_audit(
+                        user["id"],
+                        "ADD_SERVICE",
+                        f"Added {service_type} service for unit {unit_number}"
+                    )
 
                     conn.commit()
                     st.success("Service record added.")
@@ -1288,6 +1897,282 @@ elif page == "unit":
                     st.rerun()
 
         conn.close()
+
+# ============================================================
+# ADMIN TOOLS (NEW)
+# ============================================================
+elif page == "admin" and role in ["owner", "admin"]:
+    st.subheader("⚙️ Admin Tools")
+    
+    tab1, tab2, tab3, tab4 = st.tabs(["🔄 Database Backup", "📊 System Audit", "🔧 Maintenance", "📈 Performance"])
+    
+    with tab1:
+        st.markdown("### Database Backup & Restore")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🛡️ Create Backup", type="primary", use_container_width=True):
+                try:
+                    backup_path = backup_database()
+                    st.success(f"✅ Backup created: {backup_path}")
+                    
+                    # Log audit
+                    log_audit(
+                        user["id"],
+                        "DATABASE_BACKUP",
+                        "Created database backup"
+                    )
+                except Exception as e:
+                    st.error(f"Backup failed: {e}")
+        
+        with col2:
+            # List existing backups
+            if os.path.exists(BACKUP_DIR):
+                backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith('.db')], reverse=True)
+                if backups:
+                    selected_backup = st.selectbox("Select backup to restore", backups)
+                    
+                    if st.button("🔄 Restore Backup", type="secondary", use_container_width=True):
+                        if st.warning("⚠️ This will overwrite the current database. Continue?"):
+                            backup_file = os.path.join(BACKUP_DIR, selected_backup)
+                            success, message = restore_database(backup_file)
+                            if success:
+                                st.success(message)
+                                
+                                # Log audit
+                                log_audit(
+                                    user["id"],
+                                    "DATABASE_RESTORE",
+                                    f"Restored from backup: {selected_backup}"
+                                )
+                                
+                                time.sleep(2)
+                                st.rerun()
+                            else:
+                                st.error(message)
+                else:
+                    st.info("No backups available")
+            else:
+                st.info("Backup directory doesn't exist")
+        
+        # Database statistics
+        st.divider()
+        st.markdown("### Database Statistics")
+        
+        conn = connect_db()
+        c = conn.cursor()
+        
+        tables = ["contractors", "time_entries", "work_orders", "service_history", "equipment", "unit_notes", "audit_log"]
+        stats = []
+        
+        for table in tables:
+            try:
+                c.execute(f"SELECT COUNT(*) FROM {table}")
+                count = c.fetchone()[0]
+                stats.append({"Table": table, "Records": count})
+            except:
+                pass
+        
+        conn.close()
+        
+        if stats:
+            stats_df = pd.DataFrame(stats)
+            st.dataframe(stats_df, use_container_width=True, hide_index=True)
+    
+    with tab2:
+        st.markdown("### System Audit Log")
+        
+        conn = connect_db()
+        
+        # Filter options
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            days_back = st.selectbox("Time Period", ["1 day", "7 days", "30 days", "All time"], index=1)
+        with col2:
+            action_filter = st.text_input("Filter by action (optional)")
+        with col3:
+            user_filter = st.text_input("Filter by user (optional)")
+        
+        # Build query
+        query = """
+            SELECT a.action, a.details, a.timestamp, c.name as user_name, c.role as user_role
+            FROM audit_log a
+            JOIN contractors c ON a.user_id = c.id
+            WHERE 1=1
+        """
+        params = []
+        
+        if days_back != "All time":
+            days = int(days_back.split()[0])
+            query += " AND a.timestamp >= datetime('now', ?)"
+            params.append(f"-{days} days")
+        
+        if action_filter:
+            query += " AND a.action LIKE ?"
+            params.append(f"%{action_filter}%")
+        
+        if user_filter:
+            query += " AND c.name LIKE ?"
+            params.append(f"%{user_filter}%")
+        
+        query += " ORDER BY a.timestamp DESC LIMIT 100"
+        
+        audit_logs = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+        
+        if audit_logs.empty:
+            st.info("No audit logs found")
+        else:
+            # Export option
+            excel_data = export_to_excel(audit_logs, "audit_logs")
+            st.download_button(
+                label="📥 Export Audit Logs",
+                data=excel_data,
+                file_name=f"audit_logs_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            # Display logs
+            for _, r in audit_logs.iterrows():
+                role_color = {
+                    "owner": "#92400e",
+                    "supervisor": "#1e40af", 
+                    "technician": "#065f46",
+                    "admin": "#5b21b6"
+                }.get(r['user_role'], "#6b7280")
+                
+                st.markdown(f"""
+                <div style="padding:10px; border-left:4px solid {role_color}; border-bottom:1px solid #e5e7eb; margin-bottom:8px;">
+                  <div style="display:flex; justify-content:space-between;">
+                    <b>{r['action']}</b>
+                    <small style="color:#6b7280;">{r['timestamp']}</small>
+                  </div>
+                  <div>
+                    <span style="background-color:{role_color};color:white;padding:2px 6px;border-radius:4px;font-size:0.8rem;">
+                      {r['user_role']}
+                    </span>
+                    <b>{r['user_name']}</b>
+                  </div>
+                  <div style="margin-top:4px;color:#4b5563;">{r['details'] or '—'}</div>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    with tab3:
+        st.markdown("### System Maintenance")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🔄 Rebuild Indexes", use_container_width=True):
+                try:
+                    add_indexes()
+                    st.success("✅ Database indexes rebuilt")
+                    
+                    # Log audit
+                    log_audit(
+                        user["id"],
+                        "MAINTENANCE",
+                        "Rebuilt database indexes"
+                    )
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+        
+        with col2:
+            if st.button("🧹 Clean Old Notifications", use_container_width=True):
+                try:
+                    conn = connect_db()
+                    c = conn.cursor()
+                    c.execute("DELETE FROM notifications WHERE read=1 AND created_at < datetime('now', '-30 days')")
+                    deleted = c.rowcount
+                    conn.commit()
+                    conn.close()
+                    
+                    st.success(f"✅ Cleaned {deleted} old notifications")
+                    
+                    # Log audit
+                    log_audit(
+                        user["id"],
+                        "MAINTENANCE",
+                        f"Cleaned {deleted} old notifications"
+                    )
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+        
+        st.divider()
+        
+        # Demo credentials management
+        st.markdown("### Demo Accounts Management")
+        st.info("""
+        Demo accounts are for testing purposes only. In production:
+        1. Remove hardcoded demo credentials
+        2. Use environment variables for sensitive data
+        3. Implement proper user registration flow
+        """)
+        
+        if st.button("🔄 Reset Demo Passwords", type="secondary"):
+            st.warning("This would reset all demo passwords in a production environment")
+    
+    with tab4:
+        st.markdown("### System Performance")
+        
+        conn = connect_db()
+        
+        # Query performance metrics
+        metrics = []
+        
+        # Table sizes
+        tables = ["work_orders", "time_entries", "service_history", "audit_log"]
+        for table in tables:
+            try:
+                c = conn.cursor()
+                c.execute(f"SELECT COUNT(*) FROM {table}")
+                count = c.fetchone()[0]
+                metrics.append({"Metric": f"{table} records", "Value": count})
+            except:
+                pass
+        
+        # Recent activity
+        c.execute("SELECT COUNT(*) FROM audit_log WHERE timestamp > datetime('now', '-1 hour')")
+        recent_activity = c.fetchone()[0]
+        metrics.append({"Metric": "Audit logs (last hour)", "Value": recent_activity})
+        
+        # Unresolved tickets
+        c.execute("SELECT COUNT(*) FROM work_orders WHERE status IN ('open', 'in_progress')")
+        open_tickets = c.fetchone()[0]
+        metrics.append({"Metric": "Open tickets", "Value": open_tickets})
+        
+        # Pending approvals
+        c.execute("SELECT COUNT(*) FROM time_entries WHERE approved = 0 AND clock_out IS NOT NULL")
+        pending_time = c.fetchone()[0]
+        metrics.append({"Metric": "Pending time approvals", "Value": pending_time})
+        
+        conn.close()
+        
+        # Display metrics
+        metrics_df = pd.DataFrame(metrics)
+        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+        
+        # Performance recommendations
+        st.divider()
+        st.markdown("### Performance Recommendations")
+        
+        recommendations = []
+        
+        if open_tickets > 50:
+            recommendations.append("High number of open tickets. Consider assigning more technicians.")
+        
+        if pending_time > 20:
+            recommendations.append("Many pending time approvals. Review time entries regularly.")
+        
+        if recent_activity > 100:
+            recommendations.append("High system activity. Consider archiving old audit logs.")
+        
+        if recommendations:
+            for rec in recommendations:
+                st.warning(f"⚠️ {rec}")
+        else:
+            st.success("✅ System performance is within optimal ranges")
 
 # ============================================================
 # AI ASSISTANT
@@ -1328,6 +2213,13 @@ You can help with troubleshooting, work order workflow, and reporting.
                     if answer:
                         st.markdown(answer)
                         st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                        
+                        # Log audit
+                        log_audit(
+                            user["id"],
+                            "AI_CHAT",
+                            f"AI query: {prompt[:50]}..."
+                        )
                     else:
                         st.error(f"AI error: {err}")
 
@@ -1390,6 +2282,13 @@ You can help with troubleshooting, work order workflow, and reporting.
                     file_name=f"hghi_report_{start_date}_{end_date}.txt",
                     mime="text/plain"
                 )
+                
+                # Log audit
+                log_audit(
+                    user["id"],
+                    "AI_REPORT",
+                    f"Generated {report_type} report for {start_date} to {end_date}"
+                )
 
 # ============================================================
 # FOOTER
@@ -1399,6 +2298,6 @@ st.markdown(f"""
 <div style="text-align:center;color:#64748b;padding:14px;">
   <b>{COMPANY_NAME} Field Management System</b><br/>
   Owner: {OWNER_NAME} • Supervisors: {", ".join(SUPERVISORS)}<br/>
-  DeepSeek AI: {"Enabled" if bool(DEEPSEEK_API_KEY) else "Disabled"}
+  DeepSeek AI: {"Enabled" if bool(DEEPSEEK_API_KEY) else "Disabled"} • Session timeout: {SESSION_TIMEOUT_MINUTES} min
 </div>
 """, unsafe_allow_html=True)
