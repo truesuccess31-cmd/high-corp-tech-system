@@ -7,3 +7,5 @@ font = "sans serif"
 
 [server]
 maxUploadSize = 50
+
+DEEPSEEK_API_KEY="sk-YOUR-REAL-KEY-HERE"
